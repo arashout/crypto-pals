@@ -1,14 +1,15 @@
-use std::error::Error;
-use std::{fmt::Write, num::ParseIntError};
-
-extern crate base64;
-
-use base64::encode;
 use std::collections::HashMap;
 
 use std::fs::File;
+use std::io::prelude::*;
 use std::io::{self, BufRead};
 use std::path::Path;
+
+mod utils;
+mod frequency_analysis;
+
+use utils::{from_hex, to_hex, hex_to_base64};
+use frequency_analysis::{hamming};
 
 #[macro_use]
 extern crate lazy_static;
@@ -28,9 +29,56 @@ lazy_static! {
         'G' => 0.0203,'P' => 0.0182,'B' => 0.0149,'V' => 0.0111,'K' => 0.0069,'X' => 0.0017,'Q' => 0.0011,'J' => 0.0010,'Z' => 0.0007
     );
 }
-fn main() {}
-// The output is wrapped in a Result to allow matching on errors
-// Returns an Iterator to the Reader of the lines of the file.
+fn main() -> std::io::Result<()> {
+    let mut file = File::open("S1C6decoded.txt")?;
+    let mut buffer = Vec::new();
+    // read the whole file
+    file.read_to_end(&mut buffer)?;
+
+    // let input = base64::decode(&buffer).unwrap();
+    let keysizes = guess_keysizes(&buffer);
+
+    let best_keysize = keysizes.get(0).map(|t| t.0).unwrap();
+
+    // For each element of key, need to do frequency analysis
+    let mut transposed: Vec<Vec<u8>> = Vec::with_capacity(best_keysize);
+    for _ in 0..best_keysize{
+        transposed.push(Vec::new());
+    }
+
+    buffer
+        .windows(best_keysize)
+        .for_each(|window| {
+            for (j, n) in window.iter().enumerate() {
+                transposed[j].push(*n)
+            }
+    });
+
+    for (i, t_elements) in transposed.iter().enumerate() {
+        let res_t: Vec<(f64, u8)> = find_decode_xor(t_elements).iter().take(5).map(|x|x.clone()).collect();
+        println!("{} {:?}\n", i,  &res_t);
+    }
+    Ok(())
+}
+
+const MAX_KEYSIZE: usize = 40;
+fn guess_keysizes(input: &[u8]) -> Vec<(usize, f64)> {
+    let mut res = Vec::new();
+
+    for ks in 2..MAX_KEYSIZE {
+        let mut scores: Vec<f64> = Vec::new();
+        assert!(input.len()/ks > 2);
+        // TODO: Need to double check that this is legit
+        for (a,b) in input.chunks_exact(ks).zip(input.chunks_exact(ks).skip(1)){
+            scores.push( (hamming(a,b) as f64)/ks as f64  );
+        }
+
+        res.push((ks, scores.iter().fold(0.0, |acc, x| acc + x)/scores.len() as f64 ));
+    }
+    res.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    res
+}
+
 fn read_lines<P>(filename: P) -> io::Result<io::Lines<io::BufReader<File>>>
 where
     P: AsRef<Path>,
@@ -40,7 +88,9 @@ where
 }
 
 pub fn repeat_xor(input: &[u8], key: &[u8]) -> Vec<u8> {
-    // This seems somewhat cryptic
+    // 1. split the input into chunks of size key.len()
+    // 2. xor element_in_chunk element_in_key
+    // 3. convert back to Vec<u8>
     input
         .chunks(key.len())
         .map(|chunk| chunk.iter().zip(key).map(|(b, k)| b ^ k))
@@ -50,12 +100,10 @@ pub fn repeat_xor(input: &[u8], key: &[u8]) -> Vec<u8> {
         })
 }
 
-pub fn find_decode_xor(input: &str) -> Vec<(f64, String)> {
-    let b = decode_hex(input).unwrap();
-
+pub fn find_decode_xor(b: &[u8]) -> Vec<(f64, u8)> {
     let mut res_vector = Vec::new();
 
-    for n in 1..=255 {
+    for n in 1..=127 {
         let decrypted: Vec<u8> = b.iter().map(|x| x ^ n).collect();
         let res = std::str::from_utf8(&decrypted);
         if res.is_err() {
@@ -75,32 +123,15 @@ pub fn find_decode_xor(input: &str) -> Vec<(f64, String)> {
             *counter = *counter / total as f64;
         }
         let sim = similarity(&ENGLISH_FREQ, &freq);
-        res_vector.push((sim, english.to_owned()));
+        res_vector.push((sim, n));
     }
 
     res_vector.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    res_vector.reverse();
     res_vector
 }
 
-pub fn hex_to_base64(hex_string: &str) -> Result<String, ParseIntError> {
-    let bytes = decode_hex(hex_string)?;
-    Ok(encode(bytes))
-}
 
-pub fn decode_hex(s: &str) -> Result<Vec<u8>, ParseIntError> {
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16))
-        .collect()
-}
-
-pub fn encode_hex(bytes: &[u8]) -> Result<String, Box<dyn Error>> {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        write!(&mut s, "{:02x}", b)?;
-    }
-    Ok(s)
-}
 
 // Assuming Hashmap b is a subset of hashmap a
 pub fn similarity<T>(a: &HashMap<T, f64>, b: &HashMap<T, f64>) -> f64
@@ -119,35 +150,20 @@ where
     sim.powi(2) / (ma * mb)
 }
 
-#[test]
-fn s1_c1() {
-    let actual = hex_to_base64("49276d206b696c6c696e6720796f757220627261696e206c696b65206120706f69736f6e6f7573206d757368726f6f6d");
-    assert_eq!(
-        Ok("SSdtIGtpbGxpbmcgeW91ciBicmFpbiBsaWtlIGEgcG9pc29ub3VzIG11c2hyb29t".to_owned()),
-        actual
-    );
-}
 
-#[test]
-fn s1_c2() {
-    let a = decode_hex("1c0111001f010100061a024b53535009181c").unwrap();
-    let b = decode_hex("686974207468652062756c6c277320657965").unwrap();
-    let c: Vec<u8> = a.iter().zip(b.iter()).map(|(x, y)| x ^ y).collect();
-    assert_eq!(
-        "746865206b696420646f6e277420706c6179".to_owned(),
-        encode_hex(&c).unwrap()
-    )
-}
+
 
 #[test]
 fn test_similarity() {
     assert_eq!(1.0, similarity(&ENGLISH_FREQ, &ENGLISH_FREQ));
+    // assert_eq!(1.0, similarity(a: &HashMap<T, f64>, b: &HashMap<T, f64>))
+
 }
 #[test]
 fn s1_c3() {
     let mut res_vector = Vec::new();
     let b =
-        decode_hex("1b37373331363f78151b7f2b783431333d78397828372d363c78373e783a393b3736").unwrap();
+        from_hex("1b37373331363f78151b7f2b783431333d78397828372d363c78373e783a393b3736").unwrap();
     for n in 1..=255 {
         let decrypted: Vec<u8> = b.iter().map(|x| x ^ n).collect();
         let res = std::str::from_utf8(&decrypted);
@@ -172,10 +188,6 @@ fn s1_c3() {
     }
 
     res_vector.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-    for t in res_vector {
-        println!("{} {}", t.0, t.1);
-    }
-
     assert!(true);
 }
 
@@ -187,16 +199,24 @@ fn s1_c4() {
         // Consumes the iterator, returns an (Optional) String
         for line in lines {
             if let Ok(input) = line {
-                println!("{}\n\n", input);
-
+                let input = from_hex(&input).unwrap();
                 let inner_res_vector = find_decode_xor(&input);
+                
+                let inner_res_vector: Vec<(f64, u8, String)> = inner_res_vector
+                    .iter()
+                    .map(|(f, k)| {
+                        let b_english: Vec<u8> = input.iter().map(|x| x ^ k).collect();
+                        let english = std::str::from_utf8(&b_english).unwrap();
+                        (*f, *k, english.to_owned())
+                }).collect();
                 res_vector.extend(inner_res_vector);
             }
         }
     }
     res_vector.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-    for res in res_vector.iter() {
-        println!("{} {}", res.0, res.1)
+    res_vector.reverse();
+    for res in res_vector.iter() .take(50) {
+        println!("{} {} {}", res.0, res.1, res.2)
     }
     assert!(true);
 }
@@ -207,7 +227,7 @@ fn s1_c5() {
 I go crazy when I hear a cymbal"
         .as_bytes();
     let key = "ICE".as_bytes();
-    let actual = encode_hex(&repeat_xor(input, key)).unwrap();
+    let actual = to_hex(&repeat_xor(input, key)).unwrap();
     // Do I need the new line?
     let expected = "0b3637272a2b2e63622c2e69692a23693a2a3c6324202d623d63343c2a26226324272765272a282b2f20430a652e2c652a3124333a653e2b2027630c692b20283165286326302e27282f";
     assert_eq!(expected, actual);
@@ -222,3 +242,4 @@ I go crazy when I hear a cymbal"
     let key = "ICE".as_bytes();
     assert_eq!(input, repeat_xor(&repeat_xor(input, key), key))
 }
+
